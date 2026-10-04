@@ -132,3 +132,34 @@ def _apply_lightweight_migrations() -> None:
                         "FROM unloading_frozen_ports f"
                     )
                 )
+
+    # 封签换签：清单头/放行凭证头新增换签版本列，逐箱快照新增换签标示列。
+    # seal_replacements 新表由 create_all 直接建出。
+    added_seal_manifest = columns("seal_manifests")
+    with engine.begin() as conn:
+        if added_seal_manifest and "seal_version" not in added_seal_manifest:
+            # 历史库：尚无任何换签，换签版本初值 0
+            conn.execute(
+                text("ALTER TABLE seal_manifests ADD COLUMN seal_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )
+
+    added_seal_release = columns("seal_releases")
+    with engine.begin() as conn:
+        if added_seal_release and "seal_version" not in added_seal_release:
+            conn.execute(
+                text("ALTER TABLE seal_releases ADD COLUMN seal_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )
+
+    added_seal_release_item = columns("seal_release_items")
+    with engine.begin() as conn:
+        if added_seal_release_item and "replaced" not in added_seal_release_item:
+            conn.execute(
+                text("ALTER TABLE seal_release_items ADD COLUMN replaced "
+                     "BOOLEAN NOT NULL DEFAULT 0")
+            )
+            conn.execute(
+                text("ALTER TABLE seal_release_items ADD COLUMN "
+                     "replacement_seq INTEGER")
+            )

@@ -812,7 +812,9 @@ class SealManifest(Base):
     首次登记时在写锁内原子冻结：清单须覆盖方案全部箱且封签号互异；此后同
     方案重复登记同内容幂等返回原清单，异内容冲突（409），清单内容不再改
     写。scan_version 为运行元数据（不属于冻结内容）：每成功登记一条新封签
-    扫描 +1，供放行申请按期望扫描版本原子核对。
+    扫描 +1，供放行申请按期望扫描版本原子核对。seal_version 为**换签版本**
+    （方案级，初值 0）：每成功登记一次封签更换 +1，换签申请按期望换签版本
+    原子核对；不改变冻结的清单条目。
     """
 
     __tablename__ = "seal_manifests"
@@ -828,9 +830,16 @@ class SealManifest(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     # 扫描版本：0=尚无扫描；每登记一条新扫描 +1（运行元数据，非清单内容）
     scan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 换签版本：初值 0；每成功登记一次封签更换 +1（方案级，非清单内容）
+    seal_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     items: Mapped[list["SealManifestItem"]] = relationship(
+        back_populates="manifest", cascade="all, delete-orphan"
+    )
+    replacements: Mapped[list["SealReplacement"]] = relationship(
         back_populates="manifest", cascade="all, delete-orphan"
     )
     plan: Mapped[Plan] = relationship()
@@ -838,6 +847,7 @@ class SealManifest(Base):
     __table_args__ = (
         CheckConstraint("container_count >= 0", name="ck_seal_manifest_count"),
         CheckConstraint("scan_version >= 0", name="ck_seal_manifest_scan_version"),
+        CheckConstraint("seal_version >= 0", name="ck_seal_manifest_seal_version"),
     )
 
 
@@ -860,6 +870,68 @@ class SealManifestItem(Base):
                          name="uq_seal_item_container"),
         UniqueConstraint("manifest_id", "expected_seal_no",
                          name="uq_seal_item_seal"),
+    )
+
+
+class SealReplacement(Base):
+    """封签损坏后的逐箱换签登记（只追加，构成逐箱换签链）。
+
+    方案级换签版本 seal_version 初值为 0，每成功登记一次换签 +1，并随每条
+    记录以 seq_no 留档。申请号 application_no 全局唯一：同号同内容重试返回
+    首次结果快照（response_snapshot，200），同号异内容冲突（409）。
+    old_seal_no 须等于该箱当前预期封签号（原清单号或上一条换签的新号）；
+    new_seal_no 不得与旧号相同、亦不得与方案内其他箱当前预期号重复；
+    replaced_at_minute 不得早于该箱上一次换签分钟。换签不改原清单条目与
+    历史扫描：该箱当时最后一条扫描 id 记为 last_scan_id，此后放行仅接受
+    登记顺序晚于该扫描、检查分钟不早于换签分钟、且按原有效扫描排序规则胜出
+    的匹配扫描。
+    """
+
+    __tablename__ = "seal_replacements"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("seal_manifests.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # 方案内换签序号，同时是本次生效后的方案级换签版本（自 1 起递增）
+    seq_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    new_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    replaced_at_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    application_no: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    expected_seal_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 换签前该箱最后一条扫描的 id；此前扫描均为换签前旧扫描（无扫描时为 null）
+    last_scan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 上一条同箱换签 id（逐箱换签链溯源；首次换签为 null，不加外键）
+    previous_replacement_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # 请求内容指纹（方案+申请号+箱号+旧号+新号+换签分钟+期望版本+原因 的 SHA-256）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 首次成功后的响应快照（JSON 文本），供同申请号重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    manifest: Mapped[SealManifest] = relationship(back_populates="replacements")
+
+    __table_args__ = (
+        UniqueConstraint("manifest_id", "seq_no", name="uq_seal_replacement_seq"),
+        CheckConstraint("replaced_at_minute >= 0",
+                        name="ck_seal_replacement_minute"),
+        CheckConstraint("expected_seal_version >= 0",
+                        name="ck_seal_replacement_expected"),
+        CheckConstraint("old_seal_no != new_seal_no",
+                        name="ck_seal_replacement_distinct"),
+        Index("ix_seal_replacements_manifest_container",
+              "manifest_id", "container_no"),
     )
 
 
@@ -925,6 +997,10 @@ class SealRelease(Base):
     cutoff_minute: Mapped[int] = mapped_column(Integer, nullable=False)
     expected_scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
     scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 签发时方案级换签版本（初值 0；此后任何换签均使凭证扫描状态指纹失效）
+    seal_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     container_count: Mapped[int] = mapped_column(Integer, nullable=False)
     max_check_minute: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -943,6 +1019,7 @@ class SealRelease(Base):
         CheckConstraint("expected_scan_version >= 0",
                         name="ck_seal_release_expected"),
         CheckConstraint("scan_version >= 0", name="ck_seal_release_scan_version"),
+        CheckConstraint("seal_version >= 0", name="ck_seal_release_seal_version"),
         CheckConstraint("container_count >= 0", name="ck_seal_release_count"),
         CheckConstraint("max_check_minute >= 0", name="ck_seal_release_max_check"),
         Index("ix_seal_releases_plan", "plan_id"),
@@ -964,6 +1041,11 @@ class SealReleaseItem(Base):
     check_minute: Mapped[int] = mapped_column(Integer, nullable=False)
     scan_no: Mapped[str] = mapped_column(String(128), nullable=False)
     matched: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # 签发时该箱是否发生过换签；发生过时记录所依据的换签序号（逐箱最后一次）
+    replaced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    replacement_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     release: Mapped[SealRelease] = relationship(back_populates="items")
 
