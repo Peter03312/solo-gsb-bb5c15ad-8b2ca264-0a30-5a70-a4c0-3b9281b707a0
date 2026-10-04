@@ -828,9 +828,14 @@ class SealManifest(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     # 扫描版本：0=尚无扫描；每登记一条新扫描 +1（运行元数据，非清单内容）
     scan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 换签版本（方案级）：0=尚未换签；每成功登记一次换签 +1（运行元数据，非冻结内容）
+    seal_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     items: Mapped[list["SealManifestItem"]] = relationship(
+        back_populates="manifest", cascade="all, delete-orphan"
+    )
+    replacements: Mapped[list["SealReplacement"]] = relationship(
         back_populates="manifest", cascade="all, delete-orphan"
     )
     plan: Mapped[Plan] = relationship()
@@ -838,6 +843,7 @@ class SealManifest(Base):
     __table_args__ = (
         CheckConstraint("container_count >= 0", name="ck_seal_manifest_count"),
         CheckConstraint("scan_version >= 0", name="ck_seal_manifest_scan_version"),
+        CheckConstraint("seal_version >= 0", name="ck_seal_manifest_seal_version"),
     )
 
 
@@ -925,6 +931,8 @@ class SealRelease(Base):
     cutoff_minute: Mapped[int] = mapped_column(Integer, nullable=False)
     expected_scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
     scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 签发时方案级换签版本（0=签发前未换签）
+    seal_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     container_count: Mapped[int] = mapped_column(Integer, nullable=False)
     max_check_minute: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -943,6 +951,7 @@ class SealRelease(Base):
         CheckConstraint("expected_scan_version >= 0",
                         name="ck_seal_release_expected"),
         CheckConstraint("scan_version >= 0", name="ck_seal_release_scan_version"),
+        CheckConstraint("seal_version >= 0", name="ck_seal_release_seal_version"),
         CheckConstraint("container_count >= 0", name="ck_seal_release_count"),
         CheckConstraint("max_check_minute >= 0", name="ck_seal_release_max_check"),
         Index("ix_seal_releases_plan", "plan_id"),
@@ -970,4 +979,60 @@ class SealReleaseItem(Base):
     __table_args__ = (
         UniqueConstraint("release_id", "container_no",
                          name="uq_seal_release_item_container"),
+    )
+
+
+class SealReplacement(Base):
+    """封签损坏后的逐箱换签登记（只追加；申请号全局唯一用于幂等与冲突识别）。
+
+    原预期清单与历史扫描不可改：每次换签在此追加一条，形成该箱换签链，该箱
+    当前预期封签号取链上最后一条的 new_seal_no。申请须携带期望换签版本
+    （方案级，初值 0，每成功换签 +1）在写锁内原子核对。scan_id_at_replace
+    记录换签登记瞬间该箱已存在扫描的最大 id（无扫描为 0）：放行时该箱只有
+    id 更大且检查分钟不早于换签分钟的新登记扫描才有资格胜出。
+    response_snapshot 定格首次登记响应，供同申请号同内容重试幂等返回。
+    """
+
+    __tablename__ = "seal_replacements"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("seal_manifests.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    replacement_no: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    new_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    replace_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 申请人提交的期望换签版本（即换签前版本；成功后方案换签版本 +1）
+    expected_seal_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 本次登记后的方案级换签版本
+    seal_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 换签登记瞬间该箱已存在扫描的最大 id（无扫描为 0）
+    scan_id_at_replace: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 请求内容指纹（方案+申请号+箱号+原号+新号+换签分钟+原因+期望版本）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 首次登记响应快照（JSON 文本），供同申请号同内容重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    manifest: Mapped[SealManifest] = relationship(back_populates="replacements")
+
+    __table_args__ = (
+        CheckConstraint("replace_minute >= 0", name="ck_seal_repl_minute"),
+        CheckConstraint("expected_seal_version >= 0",
+                        name="ck_seal_repl_expected_version"),
+        CheckConstraint("seal_version >= 1", name="ck_seal_repl_version"),
+        CheckConstraint("scan_id_at_replace >= 0", name="ck_seal_repl_scan_id"),
+        CheckConstraint("old_seal_no <> new_seal_no", name="ck_seal_repl_diff"),
+        Index("ix_seal_replacements_container", "manifest_id", "container_no"),
     )

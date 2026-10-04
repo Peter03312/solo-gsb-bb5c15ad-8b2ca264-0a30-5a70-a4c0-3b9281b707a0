@@ -3409,15 +3409,76 @@ def _scan_content_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _scans_fingerprint(version: int, effective_rows) -> str:
-    """扫描状态指纹：扫描版本 + 各箱当前有效扫描（按箱号升序规范化）。
+def _replacement_content_hash(
+    plan_id: str, replacement_no: str, container_no: str, old_seal_no: str,
+    new_seal_no: str, replace_minute: int, reason: str, expected_seal_version: int,
+) -> str:
+    """换签内容指纹：方案+申请号+箱号+原号+新号+换签分钟+原因+期望换签版本。"""
+    payload = json.dumps(
+        {
+            "plan_id": plan_id,
+            "replacement_no": replacement_no,
+            "container_no": container_no,
+            "old_seal_no": old_seal_no,
+            "new_seal_no": new_seal_no,
+            "replace_minute": replace_minute,
+            "reason": reason,
+            "expected_seal_version": expected_seal_version,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _seal_gate_state(manifest_items, latest_replacements, scans):
+    """计算各箱当前预期封签与放行有效扫描。
+
+    - current_expected：清单原号；已换签箱取换签链最后一条的新号。
+    - effective_winner：按原有效扫描排序规则（检查分钟较晚、同分钟 id 较晚）
+      在全部扫描中胜出者（换签不重判旧扫描的历史地位）。
+    - eligible_winner：放行有效扫描——已换签箱只在“换签点之后登记
+      （scan.id > scan_id_at_replace）且检查分钟不早于换签分钟”的新扫描中
+      按同一排序规则取胜出者；未换签箱即原排序胜出者。
+
+    manifest_items：(container_no, 原预期封签号)；
+    latest_replacements：{container_no: (repl_id, 新号, 换签分钟, scan_id_at_replace)}；
+    scans：(id, scan_no, container_no, expected_seal_no, seal_no, check_minute)。
+    """
+    current_expected: dict = {}
+    effective_winner: dict = {}
+    eligible_winner: dict = {}
+    for cno, original in manifest_items:
+        last = latest_replacements.get(cno)
+        current_expected[cno] = last[1] if last is not None else original
+
+    for s in scans:
+        sid, _scan_no, cno = s[0], s[1], s[2]
+        check_minute = s[5]
+        cur = effective_winner.get(cno)
+        if cur is None or (check_minute, sid) > (cur[5], cur[0]):
+            effective_winner[cno] = s
+        last = latest_replacements.get(cno)
+        if last is not None:
+            _rid, _new_no, replace_minute, scan_id_at_replace = last
+            # 换签后新登记（id 更大）且检查分钟不早于换签分钟
+            if sid <= scan_id_at_replace or check_minute < replace_minute:
+                continue
+        cur = eligible_winner.get(cno)
+        if cur is None or (check_minute, sid) > (cur[5], cur[0]):
+            eligible_winner[cno] = s
+    return current_expected, effective_winner, eligible_winner
+
+
+def _scans_fingerprint(version: int, effective_rows, seal_version: int = 0) -> str:
+    """扫描状态指纹：扫描版本 + 换签版本 + 各箱当前放行有效扫描（按箱号升序）。
 
     effective_rows 为 (container_no, scan_no, observed_seal_no, check_minute,
-    matched) 五元组，覆盖清单全部箱（未扫描箱以 ("", "", -1, False) 占位）。
-    任何新扫描都会推进扫描版本，指纹随之改变。
+    matched) 五元组，覆盖清单全部箱（未扫描/换签后无合格扫描箱以
+    ("", "", -1, False) 占位）。任何新扫描或换签都会使指纹改变。
     """
     payload = {
         "version": version,
+        "seal_version": seal_version,
         "effective": sorted(
             ((r[0], r[1], r[2], r[3], bool(r[4])) for r in effective_rows),
             key=lambda x: x[0],
@@ -3505,7 +3566,8 @@ def register_seal_manifest(
             cursor.execute(
                 "INSERT INTO seal_manifests "
                 "(plan_id, revision_no, container_count, content_hash, "
-                "scan_version, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+                "scan_version, seal_version, created_at) "
+                "VALUES (?, ?, ?, ?, 0, 0, ?)",
                 (plan_id, revision_no_locked, len(items), content_hash, now),
             )
             manifest_id = cursor.lastrowid
@@ -3546,6 +3608,7 @@ def build_seal_manifest_out(manifest: models.SealManifest) -> dict:
         "revision_no": manifest.revision_no,
         "container_count": manifest.container_count,
         "scan_version": manifest.scan_version,
+        "seal_version": manifest.seal_version,
         "fingerprint": manifest.content_hash,
         "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
         "items": [
@@ -3642,7 +3705,17 @@ def register_seal_scan(db: Session, plan_id: str, payload) -> tuple[dict, bool]:
                     "（未知箱号），拒绝登记",
                     422,
                 )
+            # 登记时预期取该箱当前预期封签号：原清单项经逐箱换签链后的最新新号
             expected_seal = irow[0]
+            cursor.execute(
+                "SELECT new_seal_no FROM seal_replacements "
+                "WHERE manifest_id = ? AND container_no = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (manifest_id, container_no),
+            )
+            rrow = cursor.fetchone()
+            if rrow is not None:
+                expected_seal = rrow[0]
             matched = seal_no == expected_seal
             new_version = scan_version + 1
             now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -3699,18 +3772,37 @@ def register_seal_scan(db: Session, plan_id: str, payload) -> tuple[dict, bool]:
     return snapshot, idempotent_hit
 
 
-def _effective_scan_map(scans):
-    """各箱当前有效扫描：检查分钟较晚者优先，同分钟登记顺序（id）较晚者优先。"""
-    latest: dict = {}
-    for s in scans:
-        cur = latest.get(s.container_no)
-        if cur is None or (s.check_minute, s.id) > (cur.check_minute, cur.id):
-            latest[s.container_no] = s
-    return latest
+def _orm_gate_inputs(db: Session, manifest: models.SealManifest):
+    """从 ORM 装载门控计算所需：原清单、各箱最近换签、全部扫描。"""
+    items = sorted(
+        ((i.container_no, i.expected_seal_no) for i in manifest.items),
+        key=lambda x: x[0],
+    )
+    replacements = list(db.scalars(
+        select(models.SealReplacement)
+        .where(models.SealReplacement.manifest_id == manifest.id)
+        .order_by(models.SealReplacement.id)
+    ))
+    latest_replacements: dict = {}
+    for r in replacements:
+        latest_replacements[r.container_no] = (
+            r.id, r.new_seal_no, r.replace_minute, r.scan_id_at_replace
+        )
+    scans = list(db.scalars(
+        select(models.SealScan)
+        .where(models.SealScan.manifest_id == manifest.id)
+        .order_by(models.SealScan.id)
+    ))
+    scan_rows = [
+        (s.id, s.scan_no, s.container_no, s.expected_seal_no, s.seal_no,
+         s.check_minute)
+        for s in scans
+    ]
+    return items, latest_replacements, scans, scan_rows
 
 
 def get_seal_scan_status(db: Session, plan_id: str) -> dict:
-    """封签扫描状态：扫描版本、逐箱最新有效扫描（是否通过）与全部留痕记录。"""
+    """封签扫描状态：扫描/换签版本、逐箱放行有效扫描（是否通过）与全部留痕。"""
     plan = get_plan(db, plan_id)  # 方案不存在 -> 404
     manifest = db.scalar(
         select(models.SealManifest).where(models.SealManifest.plan_id == plan_id)
@@ -3719,25 +3811,28 @@ def get_seal_scan_status(db: Session, plan_id: str) -> dict:
         raise BusinessError(
             f"方案 {plan_id} 尚未登记预期封签清单，无封签扫描状态", 404
         )
-    scans = list(db.scalars(
-        select(models.SealScan)
-        .where(models.SealScan.manifest_id == manifest.id)
-        .order_by(models.SealScan.id)
-    ))
-    latest = _effective_scan_map(scans)
-    effective_ids = {s.id for s in latest.values()}
+    items, latest_replacements, scans, scan_rows = _orm_gate_inputs(db, manifest)
+    current_expected, effective_winner, eligible_winner = _seal_gate_state(
+        items, latest_replacements, scan_rows
+    )
+    effective_ids = {s[0] for s in effective_winner.values()}
+    eligible_ids = {s[0] for s in eligible_winner.values()}
 
     containers = []
-    for item in sorted(manifest.items, key=lambda x: x.container_no):
-        eff = latest.get(item.container_no)
+    for cno, original_seal in items:
+        last = latest_replacements.get(cno)
+        eff = eligible_winner.get(cno)
         containers.append({
-            "container_no": item.container_no,
-            "expected_seal_no": item.expected_seal_no,
+            "container_no": cno,
+            "expected_seal_no": original_seal,
+            "current_expected_seal_no": current_expected[cno],
+            "replaced": last is not None,
+            "last_replace_minute": last[2] if last is not None else None,
             "scanned": eff is not None,
-            "passed": bool(eff.matched) if eff is not None else False,
-            "latest_scan_no": eff.scan_no if eff is not None else None,
-            "observed_seal_no": eff.seal_no if eff is not None else None,
-            "check_minute": eff.check_minute if eff is not None else None,
+            "passed": (eff[4] == current_expected[cno]) if eff is not None else False,
+            "latest_scan_no": eff[1] if eff is not None else None,
+            "observed_seal_no": eff[4] if eff is not None else None,
+            "check_minute": eff[5] if eff is not None else None,
         })
     return {
         "plan_id": plan_id,
@@ -3745,6 +3840,7 @@ def get_seal_scan_status(db: Session, plan_id: str) -> dict:
         "plan_status": plan.status,
         "read_only": plan.status == "superseded",
         "scan_version": manifest.scan_version,
+        "seal_version": manifest.seal_version,
         "container_count": manifest.container_count,
         "containers": containers,
         "scans": [
@@ -3754,13 +3850,349 @@ def get_seal_scan_status(db: Session, plan_id: str) -> dict:
                 "expected_seal_no": s.expected_seal_no,
                 "seal_no": s.seal_no,
                 "check_minute": s.check_minute,
+                # matched 定格登记时结果，换签不改历史扫描
                 "matched": bool(s.matched),
                 "effective": s.id in effective_ids,
+                "eligible": s.id in eligible_ids,
+                "current_expected_seal_no": current_expected.get(
+                    s.container_no, s.expected_seal_no
+                ),
                 "registered_at": utc_iso(s.registered_at),
             }
             for s in scans
         ],
         "created_at": utc_iso(manifest.created_at),
+    }
+
+
+def register_seal_replacement(db: Session, plan_id: str, payload) -> tuple[dict, bool]:
+    """封签损坏后登记一次逐箱换签，返回 (换签记录快照, 是否为同申请号重试)。
+
+    原预期清单与历史扫描不可改：只在逐箱换签链追加。申请须凭方案、箱号、
+    当前预期原号、新号、换签分钟、原因、全局唯一申请号与期望换签版本（方案
+    级，初值 0，每成功换签 +1）。缺清单/未知箱/原号不符/空原因/负数分钟/
+    版本过期/方案被取代均拒绝；新号不得等于旧号或与其他箱当前预期重复；
+    换签分钟不得早于该箱上次换签。同号同内容重试返回首次快照（200），同号
+    异内容冲突（409）；任何失败均回滚不留记录。
+    """
+    replacement_no = payload.replacement_no
+    container_no = payload.container_no
+    old_seal_no = payload.old_seal_no
+    new_seal_no = payload.new_seal_no
+    replace_minute = payload.replace_minute
+    reason = payload.reason.strip()
+    expected_seal_version = payload.expected_seal_version
+    content_hash = _replacement_content_hash(
+        plan_id, replacement_no, container_no, old_seal_no, new_seal_no,
+        replace_minute, reason, expected_seal_version,
+    )
+    get_plan(db, plan_id)  # 锁前存在性预检（404）
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    snapshot = None
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 幂等/冲突优先：申请号全局唯一，同号同内容重试返回首次快照
+        cursor.execute(
+            "SELECT plan_id, content_hash, response_snapshot FROM seal_replacements "
+            "WHERE replacement_no = ?",
+            (replacement_no,),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            if existing[1] != content_hash:
+                conn.rollback()
+                suffix = "（该申请号已用于另一方案）" if existing[0] != plan_id else ""
+                raise ConflictError(
+                    f"换签申请号 {replacement_no} 已用于一次不同的换签申请{suffix}，"
+                    "同申请号异内容冲突，本次换签被拒绝"
+                )
+            idempotent_hit = True
+            snapshot = json.loads(existing[2])
+            conn.commit()
+        else:
+            # 锁内复核：方案仍已确认（取代后不再接受换签）
+            cursor.execute(
+                "SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,)
+            )
+            prow = cursor.fetchone()
+            if prow is None:
+                conn.rollback()
+                raise BusinessError(f"方案 {plan_id} 不存在", 404)
+            plan_status_locked, revision_no_locked = prow
+            if plan_status_locked == "draft":
+                conn.rollback()
+                raise ConflictError("方案尚未确认（draft），拒绝登记封签换签")
+            if plan_status_locked == "superseded":
+                conn.rollback()
+                raise ConflictError(
+                    "方案修订已被新修订取代，其封签换签已冻结为只读，"
+                    "不再接受换签登记"
+                )
+
+            cursor.execute(
+                "SELECT id, seal_version FROM seal_manifests WHERE plan_id = ?",
+                (plan_id,),
+            )
+            mrow = cursor.fetchone()
+            if mrow is None:
+                conn.rollback()
+                raise ConflictError(
+                    f"方案 {plan_id} 尚未登记预期封签清单，须先登记清单方可换签"
+                )
+            manifest_id, seal_version = mrow
+            # 期望换签版本原子核对（方案级初值 0）
+            if expected_seal_version != seal_version:
+                conn.rollback()
+                raise ConflictError(
+                    f"期望换签版本 {expected_seal_version} 已过期：当前换签版本为 "
+                    f"{seal_version}，请基于最新换签状态重新申请"
+                )
+
+            # 未知箱：须在冻结清单中
+            cursor.execute(
+                "SELECT expected_seal_no FROM seal_manifest_items "
+                "WHERE manifest_id = ? AND container_no = ?",
+                (manifest_id, container_no),
+            )
+            irow = cursor.fetchone()
+            if irow is None:
+                conn.rollback()
+                raise BusinessError(
+                    f"箱 {container_no} 不在方案 {plan_id} 的预期封签清单中"
+                    "（未知箱号），拒绝换签",
+                    422,
+                )
+            current_expected = irow[0]
+
+            # 该箱换签链：原号取最近一次换签的新号；换签分钟不得早于上次
+            cursor.execute(
+                "SELECT id, new_seal_no, replace_minute FROM seal_replacements "
+                "WHERE manifest_id = ? AND container_no = ? ORDER BY id DESC LIMIT 1",
+                (manifest_id, container_no),
+            )
+            last = cursor.fetchone()
+            previous_replacement_id = None
+            if last is not None:
+                previous_replacement_id, current_expected, last_minute = last
+                if replace_minute < last_minute:
+                    conn.rollback()
+                    raise BusinessError(
+                        f"箱 {container_no} 换签分钟 {replace_minute} 早于该箱上次"
+                        f"换签分钟 {last_minute}，拒绝换签",
+                        422,
+                    )
+            # 原号不符
+            if old_seal_no != current_expected:
+                conn.rollback()
+                raise BusinessError(
+                    f"箱 {container_no} 当前预期封签号为 {current_expected}，"
+                    f"与所给原号 {old_seal_no} 不符，拒绝换签",
+                    422,
+                )
+            # 新号不得等于旧号
+            if new_seal_no == old_seal_no:
+                conn.rollback()
+                raise BusinessError(
+                    f"箱 {container_no} 新封签号 {new_seal_no} 与当前原号相同，"
+                    "新号不得等于旧号，拒绝换签",
+                    422,
+                )
+            # 新号不得与其他箱当前预期封签号重复（含清单原号与各箱换签后新号）
+            cursor.execute(
+                "SELECT container_no, expected_seal_no FROM seal_manifest_items "
+                "WHERE manifest_id = ? AND container_no <> ?",
+                (manifest_id, container_no),
+            )
+            other_expected = {c: s for c, s in cursor.fetchall()}
+            cursor.execute(
+                "SELECT container_no, MAX(id) FROM seal_replacements "
+                "WHERE manifest_id = ? AND container_no <> ? GROUP BY container_no",
+                (manifest_id, container_no),
+            )
+            other_latest_ids = {c: rid for c, rid in cursor.fetchall()}
+            if other_latest_ids:
+                placeholders = ",".join("?" for _ in other_latest_ids)
+                cursor.execute(
+                    f"SELECT id, container_no, new_seal_no FROM seal_replacements "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(other_latest_ids.values()),
+                )
+                for _rid, c, s in cursor.fetchall():
+                    other_expected[c] = s
+            dup_owners = sorted(
+                c for c, s in other_expected.items() if s == new_seal_no
+            )
+            if dup_owners:
+                conn.rollback()
+                raise BusinessError(
+                    f"新封签号 {new_seal_no} 已为其他箱当前预期封签号"
+                    f"（箱 {', '.join(dup_owners)}），不得重复，拒绝换签",
+                    422,
+                )
+
+            # 换签点：该箱已存在扫描的最大 id（无扫描为 0），界定“换签后新登记”
+            cursor.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM seal_scans "
+                "WHERE manifest_id = ? AND container_no = ?",
+                (manifest_id, container_no),
+            )
+            scan_id_at_replace = cursor.fetchone()[0]
+
+            new_seal_version = seal_version + 1
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor.execute(
+                "INSERT INTO seal_replacements "
+                "(plan_id, manifest_id, replacement_no, container_no, old_seal_no, "
+                "new_seal_no, replace_minute, reason, expected_seal_version, "
+                "seal_version, scan_id_at_replace, content_hash, response_snapshot, "
+                "registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)",
+                (plan_id, manifest_id, replacement_no, container_no, old_seal_no,
+                 new_seal_no, replace_minute, reason, expected_seal_version,
+                 new_seal_version, scan_id_at_replace, content_hash, now),
+            )
+            replacement_id = cursor.lastrowid
+            cursor.execute(
+                "UPDATE seal_manifests SET seal_version = ? WHERE id = ?",
+                (new_seal_version, manifest_id),
+            )
+            snapshot = {
+                "replacement_id": replacement_id,
+                "replacement_no": replacement_no,
+                "plan_id": plan_id,
+                "revision_no": revision_no_locked,
+                "container_no": container_no,
+                "old_seal_no": old_seal_no,
+                "new_seal_no": new_seal_no,
+                "replace_minute": replace_minute,
+                "reason": reason,
+                "expected_seal_version": expected_seal_version,
+                "seal_version": new_seal_version,
+                "scan_id_at_replace": scan_id_at_replace,
+                "previous_replacement_id": previous_replacement_id,
+                "registered_at": utc_iso(_raw_dt(now)),
+            }
+            cursor.execute(
+                "UPDATE seal_replacements SET response_snapshot = ? WHERE id = ?",
+                (json.dumps(snapshot, ensure_ascii=False), replacement_id),
+            )
+            conn.commit()
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return snapshot, idempotent_hit
+
+
+def _replacement_record_dict(r: models.SealReplacement, previous_id) -> dict:
+    return {
+        "replacement_id": r.id,
+        "replacement_no": r.replacement_no,
+        "container_no": r.container_no,
+        "old_seal_no": r.old_seal_no,
+        "new_seal_no": r.new_seal_no,
+        "replace_minute": r.replace_minute,
+        "reason": r.reason,
+        "expected_seal_version": r.expected_seal_version,
+        "seal_version": r.seal_version,
+        "scan_id_at_replace": r.scan_id_at_replace,
+        "previous_replacement_id": previous_id,
+        "registered_at": utc_iso(r.registered_at),
+    }
+
+
+def get_seal_replacement_chain(
+    db: Session, plan_id: str, container_no: str | None = None
+) -> dict:
+    """逐箱换签链查询：全部换签留痕（只追加）+ 各箱当前预期封签。
+
+    可选 container_no 仅过滤指定箱的换签留痕（须为清单内箱，未知箱 404）；
+    逐箱当前状态始终覆盖清单全部箱。
+    """
+    plan = get_plan(db, plan_id)  # 方案不存在 -> 404
+    manifest = db.scalar(
+        select(models.SealManifest).where(models.SealManifest.plan_id == plan_id)
+    )
+    if manifest is None:
+        raise BusinessError(
+            f"方案 {plan_id} 尚未登记预期封签清单，无封签换签链", 404
+        )
+    if container_no is not None:
+        known = db.scalar(
+            select(models.SealManifestItem.id).where(
+                models.SealManifestItem.manifest_id == manifest.id,
+                models.SealManifestItem.container_no == container_no,
+            )
+        )
+        if known is None:
+            raise BusinessError(
+                f"箱 {container_no} 不在方案 {plan_id} 的预期封签清单中"
+                "（未知箱号）",
+                404,
+            )
+
+    items, latest_replacements, _scans, _scan_rows = _orm_gate_inputs(db, manifest)
+    current_expected, _eff, eligible_winner = _seal_gate_state(
+        items, latest_replacements, _scan_rows
+    )
+
+    replacements = list(db.scalars(
+        select(models.SealReplacement)
+        .where(models.SealReplacement.manifest_id == manifest.id)
+        .order_by(models.SealReplacement.id)
+    ))
+    # 链上前驱（同箱前一条）
+    prev_for: dict = {}
+    seen: dict = {}
+    for r in replacements:
+        prev_for[r.id] = seen.get(r.container_no)
+        seen[r.container_no] = r.id
+
+    containers = []
+    for cno, original_seal in items:
+        last = latest_replacements.get(cno)
+        eff = eligible_winner.get(cno)
+        containers.append({
+            "container_no": cno,
+            "expected_seal_no": original_seal,
+            "current_expected_seal_no": current_expected[cno],
+            "replaced": last is not None,
+            "last_replace_minute": last[2] if last is not None else None,
+            "scanned": eff is not None,
+            "passed": (eff[4] == current_expected[cno]) if eff is not None else False,
+            "latest_scan_no": eff[1] if eff is not None else None,
+            "observed_seal_no": eff[4] if eff is not None else None,
+            "check_minute": eff[5] if eff is not None else None,
+        })
+
+    records = [
+        _replacement_record_dict(r, prev_for[r.id])
+        for r in replacements
+        if container_no is None or r.container_no == container_no
+    ]
+    return {
+        "plan_id": plan_id,
+        "revision_no": plan.revision_no,
+        "plan_status": plan.status,
+        "seal_version": manifest.seal_version,
+        "container_count": manifest.container_count,
+        "containers": containers,
+        "replacements": records,
     }
 
 
@@ -3870,7 +4302,8 @@ def issue_seal_release(
 
             # 预期清单与期望扫描版本
             cursor.execute(
-                "SELECT id, scan_version FROM seal_manifests WHERE plan_id = ?",
+                "SELECT id, scan_version, seal_version FROM seal_manifests "
+                "WHERE plan_id = ?",
                 (plan_id,),
             )
             mrow = cursor.fetchone()
@@ -3879,7 +4312,7 @@ def issue_seal_release(
                 raise ConflictError(
                     f"方案 {plan_id} 尚未登记预期封签清单，拒绝离港放行"
                 )
-            manifest_id, scan_version = mrow
+            manifest_id, scan_version, seal_version = mrow
             if expected_scan_version != scan_version:
                 conn.rollback()
                 raise ConflictError(
@@ -3887,7 +4320,10 @@ def issue_seal_release(
                     f"{scan_version}，请基于最新扫描状态重新申请放行"
                 )
 
-            # 逐箱最新有效扫描核对：缺扫、最新扫描封签不符、检查晚于截止均拒绝
+            # 逐箱放行有效扫描核对（含换签门控）：
+            # 换签箱旧扫描保持登记时结果但不算通过，须换签后新登记
+            # （id 晚于换签点）且检查分钟不早于换签分钟的匹配扫描在按原
+            # 排序规则胜出后，才计为该箱通过。
             cursor.execute(
                 "SELECT container_no, expected_seal_no FROM seal_manifest_items "
                 "WHERE manifest_id = ?",
@@ -3895,82 +4331,110 @@ def issue_seal_release(
             )
             manifest_items = cursor.fetchall()
             cursor.execute(
-                "SELECT id, scan_no, container_no, seal_no, check_minute, matched "
-                "FROM seal_scans WHERE manifest_id = ? ORDER BY id",
+                "SELECT container_no, id, new_seal_no, replace_minute, "
+                "scan_id_at_replace FROM seal_replacements "
+                "WHERE manifest_id = ? ORDER BY id",
                 (manifest_id,),
             )
-            latest: dict = {}
-            for r in cursor.fetchall():
-                cur = latest.get(r[2])
-                if cur is None or (r[4], r[0]) > (cur[4], cur[0]):
-                    latest[r[2]] = r
+            latest_replacements: dict = {}
+            for cno, rid, new_no, rmin, bound in cursor.fetchall():
+                latest_replacements[cno] = (rid, new_no, rmin, bound)
+            cursor.execute(
+                "SELECT id, scan_no, container_no, expected_seal_no, seal_no, "
+                "check_minute, matched FROM seal_scans "
+                "WHERE manifest_id = ? ORDER BY id",
+                (manifest_id,),
+            )
+            scan_rows = [
+                (r[0], r[1], r[2], r[3], r[4], r[5]) for r in cursor.fetchall()
+            ]
+            current_expected, _eff, eligible_winner = _seal_gate_state(
+                manifest_items, latest_replacements, scan_rows
+            )
 
             missing = []
+            missing_replaced = []
             mismatched = []
             after_cutoff = []
             item_snapshot = []
             fingerprint_rows = []
             max_check = 0
-            for cno, expected_seal in sorted(manifest_items):
-                s = latest.get(cno)
+            missing_replaced = []
+            for cno, _original_seal in sorted(manifest_items):
+                expected_seal = current_expected[cno]
+                s = eligible_winner.get(cno)
                 if s is None:
-                    missing.append(cno)
+                    # 无扫描，或该箱已换签且仅有换签前旧扫描（须换签后新登记）
+                    if latest_replacements.get(cno) is not None:
+                        missing_replaced.append(cno)
+                    else:
+                        missing.append(cno)
                     fingerprint_rows.append((cno, "", "", -1, False))
                     continue
-                fingerprint_rows.append((cno, s[1], s[3], s[4], bool(s[5])))
-                if not s[5]:
+                matched = s[4] == expected_seal
+                fingerprint_rows.append((cno, s[1], s[4], s[5], matched))
+                if not matched:
                     mismatched.append({
                         "container_no": cno,
                         "expected_seal_no": expected_seal,
-                        "observed_seal_no": s[3],
-                        "check_minute": s[4],
+                        "observed_seal_no": s[4],
+                        "check_minute": s[5],
                         "scan_no": s[1],
                     })
                     continue
-                if s[4] > cutoff:
+                if s[5] > cutoff:
                     after_cutoff.append({
                         "container_no": cno,
-                        "check_minute": s[4],
+                        "check_minute": s[5],
                         "scan_no": s[1],
                     })
                     continue
-                item_snapshot.append((cno, expected_seal, s[3], s[4], s[1], 1))
-                max_check = max(max_check, s[4])
-            if missing or mismatched or after_cutoff:
+                item_snapshot.append((cno, expected_seal, s[4], s[5], s[1], 1))
+                max_check = max(max_check, s[5])
+            if missing or missing_replaced or mismatched or after_cutoff:
                 conn.rollback()
                 problems = []
                 if missing:
                     problems.append(f"{len(missing)} 箱缺扫描")
+                if missing_replaced:
+                    problems.append(
+                        f"{len(missing_replaced)} 箱换签后缺合格新扫描"
+                        "（旧扫描不算通过，须换签后重新扫描）"
+                    )
                 if mismatched:
-                    problems.append(f"{len(mismatched)} 箱最新扫描封签不符")
+                    problems.append(f"{len(mismatched)} 箱放行有效扫描封签不符")
                 if after_cutoff:
-                    problems.append(f"{len(after_cutoff)} 箱最新扫描晚于截止分钟")
+                    problems.append(f"{len(after_cutoff)} 箱放行有效扫描晚于截止分钟")
                 raise BusinessError(
                     "不满足放行条件：" + "、".join(problems)
                     + "，本次放行被拒绝且不生成凭证",
                     422,
                     extra={
-                        "missing_scans": missing,
+                        "missing_scans": missing + missing_replaced,
                         "mismatched_containers": mismatched,
                         "scans_after_cutoff": after_cutoff,
                         "cutoff_minute": cutoff,
                     },
                 )
 
-            # 全部条件满足：固化凭证（方案修订号、所用交接凭证、截止分钟、
-            # 扫描版本、扫描/实绩指纹与逐箱核对结果均随凭证不可变）
-            scans_fp = _scans_fingerprint(scan_version, fingerprint_rows)
+            # 全部条件满足：固化凭证（方案修订号、换签版本、所用交接凭证、截止
+            # 分钟、扫描版本、扫描/实绩指纹与逐箱核对结果均随凭证不可变）
+            scans_fp = _scans_fingerprint(
+                scan_version, fingerprint_rows, seal_version
+            )
             release_pk = models._new_id()
             now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
             cursor.execute(
                 "INSERT INTO seal_releases "
                 "(id, plan_id, release_no, handover_id, handover_no, cutoff_minute, "
-                "expected_scan_version, scan_version, revision_no, container_count, "
-                "max_check_minute, scans_fingerprint, actuals_fingerprint, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "expected_scan_version, scan_version, seal_version, revision_no, "
+                "container_count, max_check_minute, scans_fingerprint, "
+                "actuals_fingerprint, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (release_pk, plan_id, release_no, handover_id, hrow[1], cutoff,
-                 expected_scan_version, scan_version, revision_no_locked,
-                 len(item_snapshot), max_check, scans_fp, current_actuals_fp, now),
+                 expected_scan_version, scan_version, seal_version,
+                 revision_no_locked, len(item_snapshot), max_check, scans_fp,
+                 current_actuals_fp, now),
             )
             cursor.executemany(
                 "INSERT INTO seal_release_items "
@@ -4020,42 +4484,46 @@ def get_plan_seal_release(
 
 
 def _current_scans_state(db: Session, plan_id: str):
-    """当前扫描状态 (扫描版本, 指纹)；无预期清单时 (None, None)。"""
+    """当前扫描状态 (扫描版本, 指纹, 换签版本)；无预期清单时 (None, None, None)。
+
+    指纹基于各箱当前放行有效扫描（已换签箱须换签后合格新扫描），与放行签发
+    时口径一致：换签或换签后新扫描都会改变指纹，从而标示旧凭证失效。
+    """
     manifest = db.scalar(
         select(models.SealManifest).where(models.SealManifest.plan_id == plan_id)
     )
     if manifest is None:
-        return None, None
-    scans = list(db.scalars(
-        select(models.SealScan)
-        .where(models.SealScan.manifest_id == manifest.id)
-        .order_by(models.SealScan.id)
-    ))
-    latest = _effective_scan_map(scans)
+        return None, None, None
+    items, latest_replacements, _scans, scan_rows = _orm_gate_inputs(db, manifest)
+    current_expected, _eff, eligible_winner = _seal_gate_state(
+        items, latest_replacements, scan_rows
+    )
     rows = []
-    for item in sorted(manifest.items, key=lambda x: x.container_no):
-        s = latest.get(item.container_no)
+    for cno, _original in items:
+        s = eligible_winner.get(cno)
         if s is None:
-            rows.append((item.container_no, "", "", -1, False))
+            rows.append((cno, "", "", -1, False))
         else:
-            rows.append(
-                (item.container_no, s.scan_no, s.seal_no, s.check_minute,
-                 bool(s.matched))
-            )
-    return manifest.scan_version, _scans_fingerprint(manifest.scan_version, rows)
+            rows.append((
+                cno, s[1], s[4], s[5], s[4] == current_expected[cno],
+            ))
+    fp = _scans_fingerprint(
+        manifest.scan_version, rows, manifest.seal_version
+    )
+    return manifest.scan_version, fp, manifest.seal_version
 
 
 def build_seal_release_out(db: Session, release: models.SealRelease) -> dict:
     """组装放行凭证响应：冻结内容 + 当前有效性标示。
 
-    后续扫描、实绩更正或方案取代只使凭证显示失效（is_current=false 且
-    invalid_reasons 非空），不改签发时固化的历史内容。
+    后续扫描、封签换签、实绩更正或方案取代只使凭证显示失效
+    （is_current=false 且 invalid_reasons 非空），不改签发时固化的历史内容。
     """
     plan = db.get(models.Plan, release.plan_id)
     plan_status = plan.status if plan is not None else None
 
-    current_scan_version, current_scans_fp = _current_scans_state(
-        db, release.plan_id
+    current_scan_version, current_scans_fp, current_seal_version = (
+        _current_scans_state(db, release.plan_id)
     )
 
     actuals = db.scalar(
@@ -4075,7 +4543,11 @@ def build_seal_release_out(db: Session, release: models.SealRelease) -> dict:
     if plan_status != "confirmed":
         invalid_reasons.append("plan_not_confirmed")
     if current_scans_fp != release.scans_fingerprint:
-        invalid_reasons.append("scans_changed")
+        # 签发后有新扫描，或发生过封签换签（指纹含换签版本与放行有效扫描）
+        if (current_seal_version or 0) != (release.seal_version or 0):
+            invalid_reasons.append("seals_replaced")
+        else:
+            invalid_reasons.append("scans_changed")
     if current_actuals_fp != release.actuals_fingerprint:
         invalid_reasons.append("actuals_changed")
 
@@ -4100,6 +4572,7 @@ def build_seal_release_out(db: Session, release: models.SealRelease) -> dict:
         "cutoff_minute": release.cutoff_minute,
         "expected_scan_version": release.expected_scan_version,
         "scan_version": release.scan_version,
+        "seal_version": release.seal_version,
         "container_count": release.container_count,
         "max_check_minute": release.max_check_minute,
         "scans_fingerprint": release.scans_fingerprint,
@@ -4110,6 +4583,7 @@ def build_seal_release_out(db: Session, release: models.SealRelease) -> dict:
             "container_count": release.container_count,
             "cutoff_minute": release.cutoff_minute,
             "scan_version": release.scan_version,
+            "seal_version": release.seal_version,
             "max_check_minute": release.max_check_minute,
             "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
         },
@@ -4117,6 +4591,7 @@ def build_seal_release_out(db: Session, release: models.SealRelease) -> dict:
         "invalid_reasons": invalid_reasons,
         "plan_status": plan_status,
         "current_scan_version": current_scan_version,
+        "current_seal_version": current_seal_version,
         "current_scans_fingerprint": current_scans_fp,
         "current_actuals_fingerprint": current_actuals_fp,
         "created_at": utc_iso(release.created_at),

@@ -132,3 +132,21 @@ def _apply_lightweight_migrations() -> None:
                         "FROM unloading_frozen_ports f"
                     )
                 )
+
+    # 封签换签：方案级换签版本列为后续版本新增。
+    # 新库由 create_all 直接建出；历史库补列，既有清单/凭证换签版本均为 0
+    # （尚未发生过换签）。seal_replacements 新表同样由 create_all 建出。
+    added_manifest = columns("seal_manifests")
+    with engine.begin() as conn:
+        if added_manifest and "seal_version" not in added_manifest:
+            conn.execute(
+                text("ALTER TABLE seal_manifests ADD COLUMN seal_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )
+    added_releases = columns("seal_releases")
+    with engine.begin() as conn:
+        if added_releases and "seal_version" not in added_releases:
+            conn.execute(
+                text("ALTER TABLE seal_releases ADD COLUMN seal_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )

@@ -986,6 +986,9 @@ class SealManifestOut(BaseModel):
     scan_version: int = Field(
         ..., description="当前扫描版本：0=尚无扫描，每登记一条新扫描 +1"
     )
+    seal_version: int = Field(
+        ..., description="当前换签版本（方案级）：0=尚未换签，每成功换签一次 +1"
+    )
     fingerprint: str = Field(..., description="清单内容指纹（SHA-256 十六进制）")
     fingerprint_algorithm: str
     items: list[SealManifestItemOut] = Field(
@@ -1037,23 +1040,45 @@ class SealScanOut(BaseModel):
 
 
 class SealScanRecordOut(BaseModel):
-    """留痕扫描记录（含是否仍为该箱当前有效扫描）。"""
+    """留痕扫描记录（只追加，内容为登记时结果；含是否为该箱放行有效扫描）。"""
 
     scan_no: str
     container_no: str
-    expected_seal_no: str
+    expected_seal_no: str = Field(
+        ..., description="登记时该箱预期封签号（换签不改历史扫描，定格登记时值）"
+    )
     seal_no: str
     check_minute: int
-    matched: bool
-    effective: bool
+    matched: bool = Field(..., description="登记时实见是否与当时预期一致（定格，不改）")
+    effective: bool = Field(
+        ..., description="按原有效扫描排序规则（检查分钟较晚、同分钟登记顺序较晚）"
+        "是否曾为/仍为该箱排序胜出扫描"
+    )
+    eligible: bool = Field(
+        ..., description="是否为该箱当前放行有效扫描：换签后须为换签后新登记"
+        "（id 晚于换签点）且检查分钟不早于最近换签分钟，并在合格扫描中排序胜出"
+    )
+    current_expected_seal_no: str = Field(
+        ..., description="该箱当前预期封签号（可能由换签改变）"
+    )
     registered_at: str
 
 
 class SealContainerStatusOut(BaseModel):
     container_no: str
-    expected_seal_no: str
-    scanned: bool = Field(..., description="是否已有扫描记录")
-    passed: bool = Field(..., description="该箱当前有效扫描是否匹配预期")
+    expected_seal_no: str = Field(..., description="冻结清单原预期封签号")
+    current_expected_seal_no: str = Field(
+        ..., description="当前预期封签号（换签后为最新新号，否则同原号）"
+    )
+    replaced: bool = Field(..., description="该箱是否发生过换签")
+    last_replace_minute: int | None = Field(
+        ..., description="该箱最近一次换签分钟（未换签为 null）"
+    )
+    scanned: bool = Field(..., description="是否已有放行有效（合格）扫描记录")
+    passed: bool = Field(
+        ..., description="该箱当前放行有效扫描是否匹配当前预期"
+        "（换签箱旧扫描不算通过，须换签后新扫描）"
+    )
     latest_scan_no: str | None
     observed_seal_no: str | None
     check_minute: int | None
@@ -1063,21 +1088,123 @@ class SealScanStatusOut(BaseModel):
     plan_id: str
     revision_no: int
     plan_status: str
-    read_only: bool = Field(..., description="true=方案已被取代，不再接受扫描登记")
+    read_only: bool = Field(..., description="true=方案已被取代，不再接受扫描/换签登记")
     scan_version: int
+    seal_version: int = Field(..., description="当前换签版本（方案级）：0=尚未换签")
     container_count: int
     containers: list[SealContainerStatusOut] = Field(
-        ..., description="逐箱当前有效扫描核对状态（按箱号升序）"
+        ..., description="逐箱放行有效扫描核对状态（按箱号升序）"
     )
     scans: list[SealScanRecordOut] = Field(
-        ..., description="全部扫描留痕记录（按登记顺序升序）"
+        ..., description="全部扫描留痕记录（按登记顺序升序；内容不可改）"
     )
     created_at: str = Field(..., description="预期清单登记时间")
 
 
+class SealReplacementIn(BaseModel):
+    """封签损坏换签登记：箱号、当前预期原号、新封签号、换签分钟、原因、
+    全局唯一申请号与期望换签版本。"""
+
+    replacement_no: str = Field(
+        ..., description="全局唯一换签申请号；同号同内容重试返回首次快照，异内容冲突"
+    )
+    container_no: str = Field(..., description="箱号（须在预期封签清单中）")
+    old_seal_no: str = Field(..., description="该箱当前预期封签号（须与当前一致）")
+    new_seal_no: str = Field(
+        ..., description="新封签号（不得等于旧号，不得与其他箱当前预期封签号重复）"
+    )
+    replace_minute: int = Field(
+        ..., ge=0, description="换签分钟（非负；不得早于该箱上次换签分钟）"
+    )
+    reason: str = Field(..., min_length=1, description="换签原因（非空字符串）")
+    expected_seal_version: int = Field(
+        ..., ge=0, description="期望换签版本（方案级，初值 0）；与当前不一致返回 409"
+    )
+
+    @field_validator("replacement_no")
+    @classmethod
+    def _replacement_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "换签申请号")
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @field_validator("old_seal_no")
+    @classmethod
+    def _old_seal_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "原封签号")
+
+    @field_validator("new_seal_no")
+    @classmethod
+    def _new_seal_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "新封签号")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("换签原因不能为空")
+        return v
+
+
+class SealReplacementOut(BaseModel):
+    replacement_id: int = Field(..., description="换签记录号（服务端生成，链中顺序）")
+    replacement_no: str = Field(..., description="换签申请号（客户端提供，全局唯一）")
+    plan_id: str
+    revision_no: int = Field(..., description="登记时固化的方案修订号")
+    container_no: str
+    old_seal_no: str = Field(..., description="换签前该箱当前预期封签号")
+    new_seal_no: str = Field(..., description="换签后该箱当前预期封签号")
+    replace_minute: int
+    reason: str
+    expected_seal_version: int = Field(..., description="提交时的期望换签版本")
+    seal_version: int = Field(..., description="本次换签后的方案级换签版本")
+    scan_id_at_replace: int = Field(
+        ..., description="换签瞬间该箱已存在扫描的最大 id（无扫描为 0）；"
+                        "放行时仅 id 更大的新登记扫描才有资格"
+    )
+    previous_replacement_id: int | None = Field(
+        ..., description="该箱上一条换签记录 id（首次换签为 null）"
+    )
+    registered_at: str
+
+
+class SealReplacementRecordOut(BaseModel):
+    """逐箱换签链上的一条只追加记录。"""
+
+    replacement_id: int
+    replacement_no: str
+    container_no: str
+    old_seal_no: str
+    new_seal_no: str
+    replace_minute: int
+    reason: str
+    expected_seal_version: int
+    seal_version: int
+    scan_id_at_replace: int
+    previous_replacement_id: int | None
+    registered_at: str
+
+
+class SealReplacementChainOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    plan_status: str
+    seal_version: int = Field(..., description="当前换签版本（方案级）")
+    container_count: int
+    containers: list[SealContainerStatusOut] = Field(
+        ..., description="逐箱当前预期封签与最近换签信息（按箱号升序）"
+    )
+    replacements: list[SealReplacementRecordOut] = Field(
+        ..., description="全部换签留痕（按方案内换签先后升序；只追加不可改）"
+    )
+
+
 class SealReleaseIn(BaseModel):
     """离港放行申请：当前交接凭证、期望扫描版本、截止分钟与唯一申请号。"""
-
     release_no: str = Field(
         ..., description="放行申请号（非空字符串，全局唯一）；同号同内容重试返回原凭证"
     )
@@ -1115,6 +1242,7 @@ class SealReleaseSummaryOut(BaseModel):
     container_count: int
     cutoff_minute: int
     scan_version: int
+    seal_version: int = Field(..., description="签发时换签版本（方案级）：0=未换签")
     max_check_minute: int = Field(..., description="签发时各箱最新扫描的最大检查分钟")
     fingerprint_algorithm: str
 
@@ -1129,6 +1257,7 @@ class SealReleaseOut(BaseModel):
     cutoff_minute: int
     expected_scan_version: int
     scan_version: int = Field(..., description="签发时扫描版本")
+    seal_version: int = Field(..., description="签发时换签版本（方案级）：0=未换签")
     container_count: int
     max_check_minute: int
     scans_fingerprint: str = Field(..., description="签发时扫描状态指纹（SHA-256 十六进制）")
@@ -1143,11 +1272,16 @@ class SealReleaseOut(BaseModel):
     )
     invalid_reasons: list[str] = Field(
         ..., description="失效原因：plan_not_confirmed=方案已被取代；"
-                        "scans_changed=签发后有新扫描；actuals_changed=签发后实绩已更正/补登"
+                        "scans_changed=签发后有新扫描（无换签）；"
+                        "seals_replaced=签发后发生过封签换签；"
+                        "actuals_changed=签发后实绩已更正/补登"
     )
     plan_status: str | None = Field(..., description="方案当前状态")
     current_scan_version: int | None = Field(
         ..., description="当前扫描版本；无预期清单时为 null"
+    )
+    current_seal_version: int | None = Field(
+        ..., description="当前换签版本（方案级）；无预期清单时为 null"
     )
     current_scans_fingerprint: str | None = Field(
         ..., description="当前扫描状态指纹；无预期清单时为 null"

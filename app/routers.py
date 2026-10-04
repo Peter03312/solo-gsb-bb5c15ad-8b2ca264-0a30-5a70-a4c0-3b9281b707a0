@@ -33,6 +33,9 @@ from app.schemas import (
     SealManifestOut,
     SealReleaseIn,
     SealReleaseOut,
+    SealReplacementChainOut,
+    SealReplacementIn,
+    SealReplacementOut,
     SealScanIn,
     SealScanOut,
     SealScanStatusOut,
@@ -635,6 +638,38 @@ def register_seal_scan(
 )
 def get_seal_scan_status(plan_id: str, db: Session = Depends(get_db)):
     return services.get_seal_scan_status(db, plan_id)
+
+
+@router.post(
+    "/plans/{plan_id}/seal-replacements",
+    response_model=SealReplacementOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="封签损坏后登记逐箱换签（方案级换签版本初值 0；原清单与历史扫描不可改）",
+)
+def register_seal_replacement(
+    plan_id: str,
+    body: SealReplacementIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    view, idempotent_hit = services.register_seal_replacement(db, plan_id, body)
+    # 同申请号同内容重试返回首次快照（200）；新换签登记成功为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return view
+
+
+@router.get(
+    "/plans/{plan_id}/seal-replacements",
+    response_model=SealReplacementChainOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询逐箱换签链：全部换签留痕、各箱当前预期封签与换签版本"
+    "（可选 container_no 仅过滤该箱换签留痕）",
+)
+def get_seal_replacements(
+    plan_id: str, container_no: str | None = None, db: Session = Depends(get_db)
+):
+    return services.get_seal_replacement_chain(db, plan_id, container_no)
 
 
 @router.post(
